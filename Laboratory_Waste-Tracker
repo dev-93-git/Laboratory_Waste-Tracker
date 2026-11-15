@@ -1,0 +1,1861 @@
+#!/usr/bin/env python3
+"""Laboratory Waste Tracker.
+
+Logs hazardous and non-hazardous lab waste containers, tracks whether each one
+is still stored or has been disposed of, summarizes totals, and charts the share
+of records by waste type (all records, awaiting disposal, and disposed). Running
+totals over time get their own line graphs: total, awaiting disposal and disposed,
+each shown separately for hazardous and non-hazardous waste.
+
+Two interfaces in one file, sharing the same data:
+  python3 waste_tracker.py          open the desktop window (tkinter)
+  python3 waste_tracker.py --cli    use the text menu in the terminal
+
+If a window can't be opened (tkinter not installed, or no display), the program
+falls back to the text menu automatically.
+
+The window has a Settings menu: light / dark / high-contrast theme, export of the
+summary or of all charted data to an .xlsx spreadsheet, a dyslexia-friendly font
+toggle, and a switch to turn the click and tab animations off.
+
+Uses only the Python standard library. Data is saved to waste_log.tsv and the
+Settings choices to waste_settings.json, both next to this script.
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import sys
+import zipfile
+from datetime import date, datetime
+
+try:
+    import tkinter as tk
+    from tkinter import font as tkfont
+    from tkinter import filedialog, messagebox, simpledialog, ttk
+    HAVE_TK = True
+except ImportError:  # tkinter is optional; the text menu still works without it
+    tk = tkfont = filedialog = messagebox = simpledialog = ttk = None
+    HAVE_TK = False
+
+DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "waste_log.tsv")
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "waste_settings.json")
+
+CATEGORIES = [
+    "Halogenated solvent",
+    "Non-halogenated solvent",
+    "Acid",
+    "Base",
+    "Heavy metal",
+    "Oxidizer",
+    "Aqueous/other chemical",
+    "Biological",
+    "Sharps",
+    "Radioactive",
+    "Solid chemical-contaminated",
+    "Non-hazardous",
+]
+UNITS = ["L", "mL", "kg", "g", "mg", "mol", "items"]
+FIELDS = [
+    "id", "date", "category", "description", "quantity",
+    "unit", "location", "status", "disposed_date", "notes",
+]
+
+
+# =========================================================== shared data layer
+def clean(text):
+    """Strip characters that would break the tab-separated file."""
+    return text.replace("\t", " ").replace("\n", " ").replace("\r", " ").strip()
+
+
+def load():
+    entries = []
+    if not os.path.exists(DATA_FILE):
+        return entries
+    with open(DATA_FILE, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            parts += [""] * (len(FIELDS) - len(parts))
+            entry = dict(zip(FIELDS, parts))
+            try:
+                entry["id"] = int(entry["id"])
+                entry["quantity"] = float(entry["quantity"])
+            except ValueError:
+                continue  # skip malformed rows
+            entries.append(entry)
+    return entries
+
+
+def save(entries):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        for e in entries:
+            row = [f"{e[k]:g}" if k == "quantity" else str(e[k]) for k in FIELDS]
+            f.write("\t".join(row) + "\n")
+
+
+def valid_date(text):
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def build_entry(entries, entry_date, category, description, quantity, unit,
+                location, notes):
+    """Validate values. Returns (entry, None) or (None, error message)."""
+    entry_date, description = clean(entry_date), clean(description)
+    if not valid_date(entry_date):
+        return None, "Date must be in YYYY-MM-DD format."
+    if category not in CATEGORIES:
+        return None, "Please choose a waste category."
+    if not description:
+        return None, "Please describe the contents of the container."
+    try:
+        qty = float(quantity)
+    except ValueError:
+        qty = 0
+    if qty <= 0:
+        return None, "Quantity must be a number greater than zero."
+    if unit not in UNITS:
+        return None, "Please choose a unit."
+    new_id = max((e["id"] for e in entries), default=0) + 1
+    return {
+        "id": new_id, "date": entry_date, "category": category,
+        "description": description, "quantity": qty, "unit": unit,
+        "location": clean(location), "status": "stored", "disposed_date": "",
+        "notes": clean(notes),
+    }, None
+
+
+def filter_entries(entries, status="all", category="All", search=""):
+    search = search.strip().lower()
+    rows = []
+    for e in entries:
+        if status != "all" and e["status"] != status:
+            continue
+        if category != "All" and e["category"] != category:
+            continue
+        if search and search not in " ".join(
+            (e["description"], e["location"], e["notes"])
+        ).lower():
+            continue
+        rows.append(e)
+    return rows
+
+
+# Sort choices for the waste log: label -> (field, reverse)
+SORT_OPTIONS = {
+    "Entry order": ("id", False),
+    "Alphabetical (A-Z)": ("description", False),
+    "Alphabetical (Z-A)": ("description", True),
+    "Waste type (A-Z)": ("category", False),
+    "Waste type (Z-A)": ("category", True),
+}
+
+
+def sort_entries(rows, key="id", reverse=False):
+    """Sort records by one field. Text sorts case-insensitively; ties fall back to
+    contents, then ID, so entries of the same waste type stay in alphabetical order."""
+    numeric = key in ("id", "quantity")
+
+    def sort_key(e):
+        primary = e[key] if numeric else str(e[key]).lower()
+        return (primary, e["description"].lower(), e["id"])
+
+    return sorted(rows, key=sort_key, reverse=reverse)
+
+
+# ---- Totals over time (line graphs) -------------------------------------------
+# Quantities can only be added within one kind of unit, so the graphs show one
+# measure at a time. label: (noun, display unit, {unit: factor to the display unit})
+MEASURES = {
+    "Volume (L)": ("volume", "L", {"L": 1.0, "mL": 0.001}),
+    "Mass (g)": ("mass", "g", {"kg": 1000.0, "g": 1.0, "mg": 0.001}),
+    "Amount (mol)": ("amount", "mol", {"mol": 1.0}),
+    "Items (count)": ("item", "items", {"items": 1.0}),
+}
+
+# The line graphs: one per (waste group, status), so six in all.
+# Statuses use the same filters as the pie charts: (title, status filter)
+LINE_STATUSES = [
+    ("Total logged", None),
+    ("Awaiting disposal", "stored"),
+    ("Disposed", "disposed"),
+]
+# Everything except the "Non-hazardous" category counts as hazardous waste
+WASTE_GROUPS = ["Hazardous", "Non-hazardous"]
+LINE_EMPTY = {
+    None: "No {group} {noun} records yet",
+    "stored": "No {group} {noun} awaiting disposal",
+    "disposed": "No {group} {noun} disposed of yet",
+}
+
+
+def waste_group(category):
+    """'Non-hazardous' for the non-hazardous category, otherwise 'Hazardous'."""
+    return "Non-hazardous" if category == "Non-hazardous" else "Hazardous"
+
+
+def _parse_day(text):
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
+def waste_timeline(entries, measure, status=None, group=None):
+    """Running total of waste per category over time, in one measure's unit.
+
+    status None       -> cumulative amount logged
+    status "disposed" -> cumulative amount disposed of (by disposal date)
+    status "stored"   -> amount awaiting disposal: logged minus disposed, so it
+                         rises when waste is logged and falls when it is disposed of
+
+    group None -> every category; "Hazardous" / "Non-hazardous" -> only that group.
+
+    Records in other unit families are ignored. Returns (dates, series): dates is
+    every day with activity; series is [(category, [(date, total, has_event)])] with
+    one point per date, biggest final total first. has_event marks the days that
+    category actually changed (where the graph draws a dot)."""
+    _noun, _unit, factors = MEASURES[measure]
+    events = {}  # category -> {day: change in amount}
+
+    def add(category, day, amount):
+        by_day = events.setdefault(category, {})
+        by_day[day] = by_day.get(day, 0.0) + amount
+
+    for e in entries:
+        if group and waste_group(e["category"]) != group:
+            continue
+        factor = factors.get(e["unit"])
+        logged = _parse_day(e["date"])
+        if factor is None or logged is None:
+            continue
+        amount = e["quantity"] * factor
+        disposed = e["status"] == "disposed"
+        gone = max(_parse_day(e["disposed_date"]) or logged, logged) if disposed else None
+        if status == "disposed":
+            if disposed:
+                add(e["category"], gone, amount)
+        else:
+            add(e["category"], logged, amount)
+            if status == "stored" and disposed:
+                add(e["category"], gone, -amount)
+
+    # Leave out categories that never actually held any waste (e.g. logged and
+    # disposed of the same day, for the awaiting-disposal view)
+    kept = {}
+    for category, by_day in events.items():
+        running, peak = 0.0, 0.0
+        for d in sorted(by_day):
+            running += by_day[d]
+            peak = max(peak, round(running, 9))
+        if peak > 0:
+            kept[category] = by_day
+
+    days = sorted({d for by_day in kept.values() for d in by_day})
+    series = []
+    for category, by_day in kept.items():
+        running, points = 0.0, []
+        for d in days:
+            running += by_day.get(d, 0.0)
+            points.append((d, max(0.0, round(running, 9)), d in by_day))
+        series.append((category, points))
+    series.sort(key=lambda s: (-s[1][-1][1], s[0]))
+    return days, series
+
+
+def nice_ticks(vmax, count=4):
+    """Round axis tick values from 0 up to at least vmax, e.g. [0, 5, 10, 15]."""
+    if vmax <= 0:
+        return [0, 1]
+    raw = vmax / count
+    mag = 10 ** math.floor(math.log10(raw))
+    step = next((m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw), 10 * mag)
+    n = math.ceil(vmax / step - 1e-9)
+    return [round(i * step, 10) for i in range(n + 1)]
+
+
+def summarize(entries):
+    """Returns sorted list of (category, unit, stored_total, disposed_total)."""
+    totals = {}
+    for e in entries:
+        key = (e["category"], e["unit"])
+        stored, disposed = totals.get(key, (0.0, 0.0))
+        if e["status"] == "disposed":
+            disposed += e["quantity"]
+        else:
+            stored += e["quantity"]
+        totals[key] = (stored, disposed)
+    return [(cat, unit, s, d) for (cat, unit), (s, d) in sorted(totals.items())]
+
+
+# The three pie charts: (title, status filter, message shown when it has no records)
+CHART_GROUPS = [
+    ("All records", None, "No records yet"),
+    ("Awaiting disposal", "stored", "Nothing awaiting disposal"),
+    ("Disposed", "disposed", "Nothing disposed of yet"),
+]
+
+
+def category_counts(entries, status=None):
+    """Number of records (containers) per waste category, biggest first.
+
+    status: None = every record, "stored" = awaiting disposal, "disposed" = disposed.
+    Returns [(category, count)]; categories with no records are left out."""
+    counts = {}
+    for e in entries:
+        disposed = e["status"] == "disposed"
+        if (status == "disposed" and not disposed) or (status == "stored" and disposed):
+            continue
+        counts[e["category"]] = counts.get(e["category"], 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
+
+def pie_slices(counts):
+    """Turn [(label, count)] into pie geometry [(label, count, percent, start, extent)].
+    Angles are in degrees, clockwise from 12 o'clock, and the extents add up to 360."""
+    total = sum(n for _, n in counts)
+    slices, angle = [], 0.0
+    for label, n in counts:
+        extent = 360.0 * n / total
+        slices.append((label, n, 100.0 * n / total, angle, extent))
+        angle += extent
+    return slices
+
+
+def readable_text(color):
+    """Dark or white text, whichever reads better on the given '#rrggbb' fill."""
+    r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    return "#1E2A35" if 0.299 * r + 0.587 * g + 0.114 * b > 150 else "#FFFFFF"
+
+
+# ================================================ spreadsheet export (.xlsx)
+# A sheet is (title, header row, data rows). write_xlsx() builds a real Excel
+# workbook with nothing but zipfile, so no extra packages are needed.
+def summary_sheets(entries):
+    """The Summary tab: totals per category and unit, and the three container counts."""
+    table = [(cat, unit, stored, disposed, stored + disposed)
+             for cat, unit, stored, disposed in summarize(entries)]
+    pending = sum(1 for e in entries if e["status"] == "stored")
+    return [
+        ("Summary by category",
+         ["Category", "Unit", "Awaiting disposal", "Disposed", "Total"], table),
+        ("Container counts", ["Measure", "Containers"],
+         [("Awaiting disposal", pending), ("Disposed", len(entries) - pending),
+          ("Total containers", len(entries))]),
+    ]
+
+
+def charts_sheet(entries):
+    """The three pie charts: containers per waste type and their share, side by side."""
+    per_group = [dict(category_counts(entries, status)) for _t, status, _m in CHART_GROUPS]
+    totals = [sum(g.values()) for g in per_group]
+    seen = {c for g in per_group for c in g}
+    cats = [c for c in CATEGORIES if c in seen] + sorted(seen - set(CATEGORIES))
+    headers = ["Waste type"]
+    for title, _status, _msg in CHART_GROUPS:
+        headers += [f"{title} (containers)", f"{title} (%)"]
+    rows = []
+    for cat in cats:
+        row = [cat]
+        for counts, total in zip(per_group, totals):
+            n = counts.get(cat, 0)
+            row += [n, round(100.0 * n / total, 1) if total else 0]
+        rows.append(tuple(row))
+    return ("Share of records (pie)", headers, rows)
+
+
+def trends_sheet(entries):
+    """Every line graph, for every measure: one row per waste type and date."""
+    rows = []
+    for measure, (_noun, unit, _factors) in MEASURES.items():
+        for group in WASTE_GROUPS:
+            for title, status in LINE_STATUSES:
+                _days, series = waste_timeline(entries, measure, status, group)
+                for cat, points in series:
+                    for day, value, _changed in points:
+                        rows.append((measure, group, title, cat, day.isoformat(), value, unit))
+    return ("Trends (line graphs)",
+            ["Measure", "Waste group", "Graph", "Waste type", "Date", "Running total", "Unit"],
+            rows)
+
+
+_XML_BAD = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xml_text(value):
+    text = _XML_BAD.sub("", str(value))
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _col_name(index):
+    name, n = "", index + 1
+    while n:
+        n, rem = divmod(n - 1, 26)
+        name = chr(65 + rem) + name
+    return name
+
+
+def _sheet_xml(headers, rows):
+    table = [list(headers)] + [list(r) for r in rows]
+    widths = [8] * len(headers)
+    xml_rows = []
+    for r, row in enumerate(table, 1):
+        cells = []
+        for c, value in enumerate(row):
+            if value is None or value == "":
+                continue
+            ref = f"{_col_name(c)}{r}"
+            style = ' s="1"' if r == 1 else ""
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                cells.append(f'<c r="{ref}"{style}><v>{value:.10g}</v></c>')
+                shown = f"{value:g}"
+            else:
+                cells.append(f'<c r="{ref}"{style} t="inlineStr"><is>'
+                             f'<t xml:space="preserve">{_xml_text(value)}</t></is></c>')
+                shown = str(value)
+            if c < len(widths):
+                widths[c] = max(widths[c], min(len(shown), 60))
+        xml_rows.append(f'<row r="{r}">{"".join(cells)}</row>')
+    cols = "".join(f'<col min="{i}" max="{i}" width="{w + 3}" customWidth="1"/>'
+                   for i, w in enumerate(widths, 1))
+    return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetViews><sheetView workbookViewId="0">'
+            '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+            '</sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/>'
+            f'<cols>{cols}</cols><sheetData>{"".join(xml_rows)}</sheetData></worksheet>')
+
+
+def write_xlsx(path, sheets):
+    """Write [(title, headers, rows), ...] to an .xlsx workbook, one worksheet each."""
+    names = []
+    for title, _h, _r in sheets:
+        base = re.sub(r"[\[\]:*?/\\]", "-", title)[:31] or "Sheet"
+        name, n = base, 2
+        while name.lower() in (x.lower() for x in names):
+            suffix = f" ({n})"
+            name, n = base[:31 - len(suffix)] + suffix, n + 1
+        names.append(name)
+    main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    count = len(sheets)
+
+    content_types = (
+        head + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        + "".join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                  for i in range(1, count + 1))
+        + "</Types>")
+    root_rels = (
+        head + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="{rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+    workbook = (
+        head + f'<workbook xmlns="{main}" xmlns:r="{rel}"><sheets>'
+        + "".join(f'<sheet name="{_xml_text(n)}" sheetId="{i}" r:id="rId{i}"/>'
+                  for i, n in enumerate(names, 1))
+        + "</sheets></workbook>")
+    workbook_rels = (
+        head + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(f'<Relationship Id="rId{i}" Type="{rel}/worksheet" Target="worksheets/sheet{i}.xml"/>'
+                  for i in range(1, count + 1))
+        + f'<Relationship Id="rId{count + 1}" Type="{rel}/styles" Target="styles.xml"/></Relationships>')
+    styles = (
+        head + f'<styleSheet xmlns="{main}">'
+        '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
+        '<fills count="3"><fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFCDEFEB"/><bgColor indexed="64"/></patternFill></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/></cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>')
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", root_rels)
+        z.writestr("xl/workbook.xml", workbook)
+        z.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        z.writestr("xl/styles.xml", styles)
+        for i, (_title, headers, rows) in enumerate(sheets, 1):
+            z.writestr(f"xl/worksheets/sheet{i}.xml", _sheet_xml(headers, rows))
+
+
+# ============================================================ text interface
+def ask(label, default=""):
+    suffix = f" [{default}]" if default else ""
+    try:
+        value = input(f"{label}{suffix}: ")
+    except EOFError:
+        print()
+        sys.exit(0)
+    value = clean(value)
+    return value if value else default
+
+
+def choose(label, options, default=None):
+    for i, opt in enumerate(options, 1):
+        print(f"  {i:>2}. {opt}")
+    while True:
+        raw = ask(label, str(default) if default else "")
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1]
+        print(f"  Enter a number from 1 to {len(options)}.")
+
+
+def ask_date(label, default):
+    while True:
+        raw = ask(label, default)
+        if valid_date(raw):
+            return raw
+        print("  Use the format YYYY-MM-DD.")
+
+
+def ask_quantity():
+    while True:
+        raw = ask("Quantity")
+        try:
+            qty = float(raw)
+            if qty > 0:
+                return qty
+        except ValueError:
+            pass
+        print("  Enter a number greater than zero.")
+
+
+def ask_id(entries, label):
+    raw = ask(label)
+    if raw.isdigit():
+        for e in entries:
+            if e["id"] == int(raw):
+                return e
+    print("  No entry with that ID.")
+    return None
+
+
+def print_table(rows):
+    if not rows:
+        print("  (no entries)")
+        return
+    header = f"{'ID':>4}  {'Date':<10}  {'Category':<27}  {'Qty':>8} {'Unit':<5}  {'Status':<8}  {'Location':<12}  Description"
+    print(header)
+    print("-" * len(header))
+    for e in rows:
+        print(
+            f"{e['id']:>4}  {e['date']:<10}  {e['category']:<27}  "
+            f"{e['quantity']:>8g} {e['unit']:<5}  {e['status']:<8}  "
+            f"{e['location'][:12]:<12}  {e['description']}"
+        )
+
+
+def cli_add_entry(entries):
+    print("\n-- Add waste entry --")
+    entry_date = ask_date("Date", date.today().isoformat())
+    print("Category:")
+    category = choose("Choose category", CATEGORIES)
+    description = ""
+    while not description:
+        description = ask("Description / contents (e.g. 'acetone, 10% ethanol')")
+    quantity = ask_quantity()
+    print("Unit:")
+    unit = choose("Choose unit", UNITS, default=1)
+    location = ask("Lab / location", "")
+    notes = ask("Notes", "")
+    entry, error = build_entry(entries, entry_date, category, description,
+                               quantity, unit, location, notes)
+    if error:
+        print(f"  {error}")
+        return
+    entries.append(entry)
+    save(entries)
+    print(f"Saved entry #{entry['id']}.")
+
+
+def cli_list_entries(entries):
+    print("\n-- List entries --")
+    print("Filter by status:")
+    status = choose("Choose", ["all", "stored", "disposed"], default=1)
+    print("Filter by category (or 'All'):")
+    cat = choose("Choose", ["All"] + CATEGORIES, default=1)
+    print("Sort by:")
+    order = choose("Choose", list(SORT_OPTIONS), default=1)
+    key, reverse = SORT_OPTIONS[order]
+    print()
+    print_table(sort_entries(filter_entries(entries, status, cat), key, reverse))
+
+
+def cli_summary(entries):
+    print("\n-- Summary by category --")
+    rows = summarize(entries)
+    if not rows:
+        print("  (no entries)")
+        return
+    header = f"{'Category':<27}  {'Unit':<5}  {'Stored':>10}  {'Disposed':>10}"
+    print(header)
+    print("-" * len(header))
+    for cat, unit, stored, disposed in rows:
+        print(f"{cat:<27}  {unit:<5}  {stored:>10g}  {disposed:>10g}")
+    open_count = sum(1 for e in entries if e["status"] == "stored")
+    print(f"\n{open_count} of {len(entries)} containers are still awaiting disposal.")
+
+
+def cli_mark_disposed(entries):
+    print("\n-- Mark entry as disposed --")
+    pending = [e for e in entries if e["status"] == "stored"]
+    print_table(pending)
+    if not pending:
+        return
+    e = ask_id(entries, "Entry ID to mark disposed")
+    if e is None:
+        return
+    if e["status"] == "disposed":
+        print("  That entry is already marked disposed.")
+        return
+    e["disposed_date"] = ask_date("Disposal date", date.today().isoformat())
+    e["status"] = "disposed"
+    save(entries)
+    print(f"Entry #{e['id']} marked disposed.")
+
+
+def cli_delete_entry(entries):
+    print("\n-- Delete entry --")
+    print_table(entries)
+    if not entries:
+        return
+    e = ask_id(entries, "Entry ID to delete")
+    if e is None:
+        return
+    if ask(f"Delete entry #{e['id']} ({e['description']})? y/N", "n").lower() != "y":
+        print("Cancelled.")
+        return
+    entries.remove(e)
+    save(entries)
+    print("Deleted.")
+
+
+def cli_charts(entries):
+    print("\n-- Share of records by waste type --")
+    for title, status, empty_text in CHART_GROUPS:
+        slices = pie_slices(category_counts(entries, status))
+        total = sum(s[1] for s in slices)
+        print(f"\n{title}  ({total} record{'s' if total != 1 else ''})")
+        if not slices:
+            print(f"  {empty_text}")
+            continue
+        for cat, n, pct, _start, _extent in slices:
+            bar = "#" * max(1, round(pct / 100 * 30))
+            print(f"  {cat:<27} {n:>4}  {pct:>5.1f}%  {bar}")
+
+
+def cli_trends(entries):
+    print("\n-- Waste totals over time --")
+    print("Measure:")
+    measure = choose("Choose", list(MEASURES), default=1)
+    noun, unit, _factors = MEASURES[measure]
+    for group in WASTE_GROUPS:
+        for title, status in LINE_STATUSES:
+            _days, series = waste_timeline(entries, measure, status, group)
+            print(f"\n{group} · {title}  [{measure}]")
+            if not series:
+                print(f"  {LINE_EMPTY[status].format(noun=noun, group=group.lower())}")
+                continue
+            for cat, points in series:
+                steps = "   ".join(f"{d.isoformat()}: {v:g} {unit}" for d, v, changed in points if changed)
+                print(f"  {cat:<27} {steps}")
+
+
+MENU = """
+=== Laboratory Waste Tracker ===
+  1. Add waste entry
+  2. List entries
+  3. Summary by category
+  4. Mark entry as disposed
+  5. Delete entry
+  6. Charts (share of records by type)
+  7. Trends (waste totals over time)
+  8. Quit"""
+
+
+def run_cli():
+    entries = load()
+    actions = {
+        "1": cli_add_entry, "2": cli_list_entries, "3": cli_summary,
+        "4": cli_mark_disposed, "5": cli_delete_entry, "6": cli_charts,
+        "7": cli_trends,
+    }
+    while True:
+        print(MENU)
+        choice = ask("Select an option")
+        if choice == "8":
+            print("Goodbye.")
+            break
+        action = actions.get(choice)
+        if action:
+            action(entries)
+        else:
+            print("  Please enter a number from 1 to 8.")
+
+
+# ======================================================================= theme
+# Three palettes. set_theme() copies the chosen one into the module-level names
+# below (BG, SURFACE, ...), which the drawing code reads each time it paints.
+#   BG / SURFACE / SURFACE_ALT / BORDER   backgrounds, cards and inputs, zebra rows, outlines
+#   ACCENT*                               buttons, focus rings (ACCENT_TEXT = text on a button)
+#   SELECT / SELECT_TEXT                  selected table rows and dropdown items
+#   TAB_*                                 inactive (LIGHT) and active (DEEP) tabs
+#   TEXT / MUTED / DANGER*                body text, quiet text, destructive actions
+#   DEFAULT_CATEGORY_COLOR                the "other = black" hazard color (light on dark themes)
+THEMES = {
+    "light": dict(
+        BG="#EDF1F5", SURFACE="#FFFFFF", SURFACE_ALT="#F4F7FA", BORDER="#D8DFE6",
+        ACCENT="#00968D", ACCENT_HOVER="#007A72", ACCENT_TEXT="#FFFFFF",
+        SELECT="#CDEFEB", SELECT_TEXT="#1E2A35",
+        TAB_LIGHT="#B6E6E1", TAB_LIGHT_HOVER="#9BDAD4", TAB_LIGHT_TEXT="#00574F",
+        TAB_DEEP="#00706A", TAB_DEEP_TEXT="#FFFFFF",
+        TEXT="#1E2A35", MUTED="#6B7A89", DANGER="#B3261E", DANGER_HOVER="#FDE8E6",
+        DEFAULT_CATEGORY_COLOR="#111111",
+    ),
+    "dark": dict(
+        BG="#12171D", SURFACE="#1B222A", SURFACE_ALT="#232C36", BORDER="#33404D",
+        ACCENT="#2EC4B6", ACCENT_HOVER="#4AD6C9", ACCENT_TEXT="#08201E",
+        SELECT="#25504F", SELECT_TEXT="#F1F5F9",
+        TAB_LIGHT="#243B3E", TAB_LIGHT_HOVER="#2D4C50", TAB_LIGHT_TEXT="#9FE3DC",
+        TAB_DEEP="#1C8F86", TAB_DEEP_TEXT="#FFFFFF",
+        TEXT="#E6EDF3", MUTED="#9AA7B4", DANGER="#FF7B72", DANGER_HOVER="#3A2224",
+        DEFAULT_CATEGORY_COLOR="#E6EDF3",
+    ),
+    "contrast": dict(
+        BG="#000000", SURFACE="#000000", SURFACE_ALT="#1C1C1C", BORDER="#FFFFFF",
+        ACCENT="#FFD400", ACCENT_HOVER="#FFFFFF", ACCENT_TEXT="#000000",
+        SELECT="#FFD400", SELECT_TEXT="#000000",
+        TAB_LIGHT="#000000", TAB_LIGHT_HOVER="#2B2B2B", TAB_LIGHT_TEXT="#FFFFFF",
+        TAB_DEEP="#FFD400", TAB_DEEP_TEXT="#000000",
+        TEXT="#FFFFFF", MUTED="#D9D9D9", DANGER="#FF8A80", DANGER_HOVER="#3A0000",
+        DEFAULT_CATEGORY_COLOR="#FFFFFF",
+    ),
+}
+THEME_LABELS = {"light": "Light mode", "dark": "Dark mode", "contrast": "High contrast mode"}
+OTHER_CATEGORY = "Aqueous/other chemical"  # the category whose hazard color is "other"
+
+
+def set_theme(name):
+    """Make `name` the active palette (updates the module-level color names)."""
+    globals().update(THEMES.get(name, THEMES["light"]))
+    if "CATEGORY_COLORS" in globals():
+        CATEGORY_COLORS[OTHER_CATEGORY] = DEFAULT_CATEGORY_COLOR
+
+FONT_CANDIDATES = (
+    "Segoe UI Variable Text", "Segoe UI", "SF Pro Text", ".SF NS Text",
+    "Helvetica Neue", "Inter", "Cantarell", "Noto Sans", "DejaVu Sans",
+)
+# Dyslexia-friendly fonts, best first. OpenDyslexic is the dedicated one (free from
+# opendyslexic.org); the rest are widely recommended alternatives, and the last
+# few ship with Windows and macOS.
+DYSLEXIC_FONT_CANDIDATES = (
+    "OpenDyslexic", "OpenDyslexic3", "OpenDyslexicAlta", "Lexend", "Lexend Deca",
+    "Atkinson Hyperlegible", "Comic Neue", "Comic Sans MS", "Verdana",
+)
+
+# Hazard color code for each waste category (shown as a dot in the tables/form).
+# Anything not listed here (including "other" categories) falls back to black.
+CATEGORY_COLORS = {
+    "Halogenated solvent": "#F5D90A",        # yellow
+    "Non-halogenated solvent": "#2F6FDE",    # blue
+    "Acid": "#1B5E20",                       # dark green
+    "Base": "#0FB5A6",                       # teal
+    "Heavy metal": "#8A8F98",                # gray
+    "Oxidizer": "#F57C00",                   # orange
+    "Biological": "#D62839",                 # red
+    "Sharps": "#FF1FAF",                     # neon pink
+    "Radioactive": "#A4E81B",                # lime green
+    "Solid chemical-contaminated": "#7B3FC4",# purple
+    "Aqueous/other chemical": "#111111",     # other = black
+    "Non-hazardous": "#8D5524",              # brown
+}
+set_theme("light")  # starting palette; the window applies the saved theme on launch
+
+
+def make_swatch(master, color, size=14):
+    """Build a small filled-circle image used as a colored category marker."""
+    img = tk.PhotoImage(master=master, width=size, height=size)
+    r = size / 2
+    for y in range(size):
+        half = max(r * r - (y + 0.5 - r) ** 2, 0) ** 0.5
+        x0, x1 = int(round(r - half)), int(round(r + half))
+        if x1 > x0:
+            img.put(color, to=(x0, y, x1, y + 1))
+    return img
+
+
+def enable_hidpi():
+    """Avoid blurry text on Windows high-DPI displays."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
+
+# ================================================================ settings
+DEFAULT_SETTINGS = {"theme": "light", "dyslexic_font": False, "animations": True}
+
+
+def load_settings():
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return settings
+    if isinstance(saved, dict):
+        if saved.get("theme") in THEMES:
+            settings["theme"] = saved["theme"]
+        for key in ("dyslexic_font", "animations"):
+            if isinstance(saved.get(key), bool):
+                settings[key] = saved[key]
+    return settings
+
+
+def save_settings(settings):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except OSError:
+        pass  # settings are a convenience; never interrupt the user over them
+
+
+def walk_widgets(widget):
+    """Every widget below `widget`, depth first."""
+    for child in widget.winfo_children():
+        yield child
+        yield from walk_widgets(child)
+
+
+_SYSTEM_FONT = {}
+
+
+def pick_font_family(root, dyslexic=False):
+    """Choose the interface font. Returns (family, matched); matched is False when a
+    dyslexia-friendly font was asked for but none is installed."""
+    available = set(tkfont.families(root))
+    # Remember the system default before we ever change it, as the last resort
+    _SYSTEM_FONT.setdefault("family", tkfont.nametofont("TkDefaultFont").actual("family"))
+    normal = next((f for f in FONT_CANDIDATES if f in available), _SYSTEM_FONT["family"])
+    if not dyslexic:
+        return normal, True
+    friendly = next((f for f in DYSLEXIC_FONT_CANDIDATES if f in available), None)
+    return (friendly, True) if friendly else (normal, False)
+
+
+def mix_colors(c1, c2, t):
+    """Blend two '#rrggbb' colors: t=0 gives c1, t=1 gives c2."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
+
+
+def ease_out(t):
+    return 1 - (1 - t) ** 3
+
+
+# Fonts shared by the canvas charts. They are named Font objects, so changing the
+# family here (dyslexic font on/off) reaches every chart.
+APP_FONTS = {}
+
+
+def _set_app_font(root, key, **options):
+    font = APP_FONTS.get(key)
+    if font is None:
+        APP_FONTS[key] = tkfont.Font(root=root, **options)
+    else:
+        font.configure(**options)
+
+
+def apply_theme(root, theme="light", family=None):
+    """Configure a flat, minimalist ttk theme in the given palette and font family.
+    Safe to call again to switch theme or font. Returns the font family used."""
+    set_theme(theme)
+    if family is None:
+        family, _matched = pick_font_family(root)
+    for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+        tkfont.nametofont(name).configure(family=family, size=10)
+    _set_app_font(root, "small", family=family, size=9)
+    _set_app_font(root, "title", family=family, size=12, weight="bold")
+    _set_app_font(root, "label", family=family, size=9, weight="bold")
+
+    root.configure(bg=BG)
+    # Dropdown list of comboboxes is a plain tk Listbox; style it too.
+    root.option_add("*TCombobox*Listbox.background", SURFACE)
+    root.option_add("*TCombobox*Listbox.foreground", TEXT)
+    root.option_add("*TCombobox*Listbox.selectBackground", SELECT)
+    root.option_add("*TCombobox*Listbox.selectForeground", SELECT_TEXT)
+    root.option_add("*TCombobox*Listbox.borderWidth", 0)
+    root.option_add("*TCombobox*Listbox.highlightThickness", 0)
+
+    s = ttk.Style(root)
+    s.theme_use("clam")
+    s.configure(".", background=BG, foreground=TEXT, bordercolor=BORDER,
+                lightcolor=BG, darkcolor=BG, focuscolor=BG, borderwidth=0)
+
+    # --- frames and labels
+    s.configure("TFrame", background=BG)
+    s.configure("Card.TFrame", background=SURFACE, bordercolor=BORDER,
+                borderwidth=1, relief="solid")
+    s.configure("Stat.TFrame", background=SURFACE_ALT, bordercolor=BORDER,
+                borderwidth=1, relief="solid")
+    s.configure("TLabel", background=BG, foreground=TEXT)
+    s.configure("Muted.TLabel", background=BG, foreground=MUTED, font=(family, 9))
+    s.configure("Card.TLabel", background=SURFACE, foreground=TEXT)
+    s.configure("Caption.TLabel", background=SURFACE, foreground=MUTED, font=(family, 9))
+    s.configure("Heading.TLabel", background=SURFACE, foreground=TEXT,
+                font=(family, 13, "bold"))
+    s.configure("StatCaption.TLabel", background=SURFACE_ALT, foreground=MUTED,
+                font=(family, 9))
+    s.configure("StatValue.TLabel", background=SURFACE_ALT, foreground=TEXT,
+                font=(family, 24, "bold"))
+    s.configure("Empty.TLabel", background=SURFACE, foreground=MUTED,
+                font=(family, 11))
+
+    # --- inputs
+    field = dict(fieldbackground=SURFACE, background=SURFACE, foreground=TEXT,
+                 bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+                 insertcolor=TEXT, padding=6)
+    s.configure("TEntry", **field)
+    s.configure("TCombobox", arrowcolor=MUTED, **field)
+    focus_ring = [("focus", ACCENT)]
+    s.map("TEntry", bordercolor=focus_ring, lightcolor=focus_ring, darkcolor=focus_ring)
+    s.map("TCombobox",
+          bordercolor=focus_ring, lightcolor=focus_ring, darkcolor=focus_ring,
+          fieldbackground=[("readonly", SURFACE)],
+          background=[("readonly", SURFACE), ("active", SURFACE)],
+          selectbackground=[("readonly", SURFACE)],
+          selectforeground=[("readonly", TEXT)],
+          arrowcolor=[("active", TEXT), ("readonly", MUTED)])
+
+    # --- buttons: plain, accent (primary), danger
+    s.configure("TButton", background=SURFACE, foreground=TEXT, bordercolor=BORDER,
+                lightcolor=SURFACE, darkcolor=SURFACE, focuscolor=SURFACE,
+                padding=(14, 7), relief="flat")
+    s.map("TButton", background=[("active", SURFACE_ALT)],
+          bordercolor=[("active", MUTED)])
+    s.configure("Accent.TButton", background=ACCENT, foreground=ACCENT_TEXT,
+                bordercolor=ACCENT, lightcolor=ACCENT, darkcolor=ACCENT,
+                focuscolor=ACCENT, font=(family, 10, "bold"))
+    s.map("Accent.TButton", background=[("active", ACCENT_HOVER)],
+          bordercolor=[("active", ACCENT_HOVER)])
+    s.configure("Danger.TButton", foreground=DANGER)
+    s.map("Danger.TButton", background=[("active", DANGER_HOVER)],
+          bordercolor=[("active", DANGER)])
+
+    # --- tabs
+    s.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 0))
+    # Inactive tab: small, light teal with dark teal text.
+    # Active tab: larger (more padding, bigger bold font), deep teal, white text.
+    s.configure("TNotebook.Tab", background=TAB_LIGHT, foreground=TAB_LIGHT_TEXT,
+                padding=(14, 6), bordercolor=BG, lightcolor=TAB_LIGHT,
+                darkcolor=TAB_LIGHT, borderwidth=2, font=(family, 9))
+    s.map("TNotebook.Tab",
+          background=[("selected", TAB_DEEP), ("active", TAB_LIGHT_HOVER)],
+          foreground=[("selected", TAB_DEEP_TEXT), ("active", TAB_LIGHT_TEXT)],
+          lightcolor=[("selected", TAB_DEEP), ("active", TAB_LIGHT_HOVER)],
+          darkcolor=[("selected", TAB_DEEP), ("active", TAB_LIGHT_HOVER)],
+          bordercolor=[("selected", BG)],
+          font=[("selected", (family, 11, "bold"))],
+          padding=[("selected", (26, 11))])
+
+    # --- tables
+    s.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])  # no outer border
+    s.configure("Treeview", background=SURFACE, fieldbackground=SURFACE,
+                foreground=TEXT, rowheight=32, borderwidth=0)
+    s.map("Treeview", background=[("selected", SELECT)],
+          foreground=[("selected", SELECT_TEXT)])
+    s.configure("Treeview.Heading", background=SURFACE, foreground=MUTED,
+                font=(family, 9, "bold"), relief="flat", padding=(8, 9),
+                bordercolor=BORDER, lightcolor=SURFACE, darkcolor=SURFACE)
+    s.map("Treeview.Heading", background=[("active", SURFACE_ALT)],
+          foreground=[("active", TEXT)])
+
+    # --- scrollbars: thin and quiet
+    for orient in ("Vertical", "Horizontal"):
+        s.configure(f"{orient}.TScrollbar", background=BORDER, troughcolor=SURFACE,
+                    bordercolor=SURFACE, lightcolor=BORDER, darkcolor=BORDER,
+                    arrowcolor=SURFACE, gripcount=0)
+        s.map(f"{orient}.TScrollbar", background=[("active", MUTED)])
+    return family
+
+
+# ================================================================ GUI window
+STATUS_LABEL = {"stored": "● Stored", "disposed": "✓ Disposed"}
+
+TREE_COLUMNS = [
+    # key, heading, width, anchor
+    ("id", "ID", 45, "e"),
+    ("date", "Date", 90, "center"),
+    ("category", "Category", 170, "w"),
+    ("description", "Description", 230, "w"),
+    ("quantity", "Qty", 70, "e"),
+    ("unit", "Unit", 55, "center"),
+    ("location", "Location", 110, "w"),
+    ("status", "Status", 95, "w"),
+    ("disposed_date", "Disposed", 90, "center"),
+    ("notes", "Notes", 160, "w"),
+]
+
+
+class PieChart(tk.Canvas if HAVE_TK else object):
+    """Pie chart of record counts by waste category, with a legend underneath.
+
+    Slices use the category color code. The legend gives every category's exact
+    count and share, so small or similar slices can still be read precisely, and
+    hovering a slice shows its details."""
+
+    TITLE_H = 58  # room above the pie for the title and the hover hint
+    PAD = 16
+
+    def __init__(self, parent, title, status, empty_text):
+        super().__init__(parent, bg=SURFACE, bd=0, highlightthickness=1,
+                         highlightbackground=BORDER, width=240, height=320)
+        self.title, self.status, self.empty_text = title, status, empty_text
+        self.counts, self.hint, self.base_hint = [], None, ""
+        self.f_title, self.f_label, self.f_small = (
+            APP_FONTS["title"], APP_FONTS["label"], APP_FONTS["small"])
+        self.bind("<Configure>", lambda _e: self.redraw())
+
+    def retheme(self):
+        self.configure(bg=SURFACE, highlightbackground=BORDER)
+        self.redraw()
+
+    def set_entries(self, entries):
+        self.counts = category_counts(entries, self.status)
+        self.redraw()
+
+    def _fit(self, text, max_px):
+        """Shorten text with an ellipsis so it fits in max_px."""
+        if self.f_small.measure(text) <= max_px:
+            return text
+        while text and self.f_small.measure(text + "…") > max_px:
+            text = text[:-1]
+        return text + "…"
+
+    def redraw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 80 or h < 120:
+            return
+        pad = self.PAD
+        slices = pie_slices(self.counts)
+        total = sum(s[1] for s in slices)
+        self.base_hint = f"{total} record{'s' if total != 1 else ''}"
+        self.create_text(pad, 22, text=self.title, anchor="w", font=self.f_title, fill=TEXT)
+        self.hint = self.create_text(pad, 44, text=self.base_hint, anchor="w",
+                                     font=self.f_small, fill=MUTED)
+        if not slices:
+            self.create_text(w / 2, h / 2, text=self.empty_text, font=self.f_small, fill=MUTED)
+            return
+
+        # Size the pie to whatever space is left after the legend
+        row_h = 20
+        d = min(w - 2 * pad, h - self.TITLE_H - len(slices) * row_h - 2 * pad)
+        if d < 90:  # tight on space: compact legend rows
+            row_h = 15
+            d = min(w - 2 * pad, h - self.TITLE_H - len(slices) * row_h - 2 * pad)
+        d = max(d, 60)
+        x0, y0 = (w - d) / 2, self.TITLE_H
+        r = d / 2
+        cx, cy = x0 + r, y0 + r
+
+        for i, (cat, n, pct, start, extent) in enumerate(slices):
+            color = CATEGORY_COLORS.get(cat, DEFAULT_CATEGORY_COLOR)
+            tag = f"slice{i}"
+            if len(slices) == 1:  # Tk draws nothing for a 360-degree arc, so use a circle
+                self.create_oval(x0, y0, x0 + d, y0 + d, fill=color, outline=SURFACE,
+                                 width=2, tags=(tag,))
+            else:  # Tk angles run counter-clockwise from 3 o'clock; ours run clockwise from 12
+                self.create_arc(x0, y0, x0 + d, y0 + d, start=90 - start, extent=-extent,
+                                fill=color, outline=SURFACE, width=2, style="pieslice",
+                                tags=(tag,))
+            detail = self._fit(f"{cat}: {n} record{'s' if n != 1 else ''} ({pct:.1f}%)", w - 2 * pad)
+            self.tag_bind(tag, "<Enter>", lambda _e, t=detail: self.itemconfigure(self.hint, text=t))
+            self.tag_bind(tag, "<Leave>", lambda _e: self.itemconfigure(self.hint, text=self.base_hint))
+            if pct >= 7 and d >= 110:  # percentage inside slices big enough to hold it
+                if len(slices) == 1:
+                    lx, ly = cx, cy
+                else:
+                    mid = math.radians(90 - start - extent / 2)
+                    lx, ly = cx + 0.66 * r * math.cos(mid), cy - 0.66 * r * math.sin(mid)
+                self.create_text(lx, ly, text=f"{pct:.0f}%", font=self.f_label,
+                                 fill=readable_text(color), tags=(tag,))
+
+        # Legend: color swatch, category, exact count and share
+        ly = y0 + d + pad
+        for cat, n, pct, _start, _extent in slices:
+            color = CATEGORY_COLORS.get(cat, DEFAULT_CATEGORY_COLOR)
+            mid_y = ly + row_h / 2
+            self.create_rectangle(pad, mid_y - 5, pad + 10, mid_y + 5, fill=color, outline="")
+            value = f"{n} · {pct:.1f}%"
+            self.create_text(w - pad, mid_y, text=value, anchor="e", font=self.f_small, fill=TEXT)
+            room = w - 2 * pad - 16 - self.f_small.measure(value) - 8
+            self.create_text(pad + 16, mid_y, text=self._fit(cat, room), anchor="w",
+                             font=self.f_small, fill=TEXT)
+            ly += row_h
+
+
+def fit_text(font, text, max_px):
+    """Shorten text with an ellipsis so it fits in max_px (font is a tkfont.Font)."""
+    if font.measure(text) <= max_px:
+        return text
+    while text and font.measure(text + "…") > max_px:
+        text = text[:-1]
+    return text + "…"
+
+
+class LineChart(tk.Canvas if HAVE_TK else object):
+    """Line graph of running waste totals over time for one waste group (hazardous or
+    non-hazardous) and one status (total, awaiting disposal or disposed), with one
+    line per waste category in that group.
+
+    Lines use the category color code and dots mark the days a category changed.
+    Hovering a dot shows its category, date and amount at the top right."""
+
+    PAD, LEFT, RIGHT, TOP, BOTTOM = 16, 56, 22, 38, 28
+
+    def __init__(self, parent, title, status, group):
+        super().__init__(parent, bg=SURFACE, bd=0, highlightthickness=1,
+                         highlightbackground=BORDER, height=110)
+        self.title, self.status, self.group = title, status, group
+        self.measure, self.dates, self.series = None, [], []
+        self.hint, self.base_hint = None, ""
+        self.f_title, self.f_small = APP_FONTS["title"], APP_FONTS["small"]
+        self.bind("<Configure>", lambda _e: self.redraw())
+
+    def retheme(self):
+        self.configure(bg=SURFACE, highlightbackground=BORDER)
+        self.redraw()
+
+    def set_data(self, entries, measure):
+        self.measure = measure
+        self.dates, self.series = waste_timeline(entries, measure, self.status, self.group)
+        self.redraw()
+
+    def redraw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if self.measure is None or w < 240 or h < 100:
+            return
+        noun, unit, _factors = MEASURES[self.measure]
+        pad = self.PAD
+        self.create_text(pad, 18, text=self.title, anchor="w", font=self.f_title, fill=TEXT)
+        total = sum(points[-1][1] for _cat, points in self.series)
+        self.base_hint = f"Total {total:g} {unit}" if self.series else ""
+        self.hint_room = w - 2 * pad - self.f_title.measure(self.title) - 16
+        self.hint = self.create_text(w - pad, 18, text=fit_text(self.f_small, self.base_hint, self.hint_room),
+                                     anchor="e", font=self.f_small, fill=MUTED)
+        if not self.series:
+            self.create_text(w / 2, h / 2 + 8,
+                             text=LINE_EMPTY[self.status].format(noun=noun, group=self.group.lower()),
+                             font=self.f_small, fill=MUTED)
+            return
+
+        x0, x1 = self.LEFT, w - self.RIGHT
+        y0, y1 = self.TOP, h - self.BOTTOM
+        ticks = nice_ticks(max(v for _cat, pts in self.series for _d, v, _e in pts))
+        top = ticks[-1]
+
+        def ypos(value):
+            return y1 - (value / top) * (y1 - y0) if top else y1
+
+        for t in ticks:  # light grid + value labels
+            self.create_line(x0, ypos(t), x1, ypos(t), fill=BORDER, width=1)
+            self.create_text(x0 - 8, ypos(t), text=f"{t:g}", anchor="e", font=self.f_small, fill=MUTED)
+        self.create_text(x0 - 8, y0 - 14, text=unit, anchor="e", font=self.f_small, fill=MUTED)
+
+        first, last = self.dates[0].toordinal(), self.dates[-1].toordinal()
+        span = last - first
+
+        def xpos(day):
+            return (x0 + x1) / 2 if span == 0 else x0 + (day.toordinal() - first) / span * (x1 - x0)
+
+        # Date labels along the bottom
+        count = 1 if span == 0 else min(span + 1, max(2, int((x1 - x0) / 110) + 1))
+        for i in range(count):
+            day = date.fromordinal(first + (round(span * i / (count - 1)) if count > 1 else 0))
+            anchor = "n" if 0 < i < count - 1 or count == 1 else ("nw" if i == 0 else "ne")
+            self.create_text(xpos(day), y1 + 7, text=day.isoformat(), anchor=anchor,
+                             font=self.f_small, fill=MUTED)
+        self.create_line(x0, y1, x1, y1, fill=MUTED, width=1)
+
+        for cat, points in self.series:
+            color = CATEGORY_COLORS.get(cat, DEFAULT_CATEGORY_COLOR)
+            if len(points) > 1:
+                coords = [c for d, v, _e in points for c in (xpos(d), ypos(v))]
+                self.create_line(*coords, fill=color, width=2, capstyle="round", joinstyle="round")
+            for d, v, changed in points:
+                if not changed:
+                    continue
+                px, py = xpos(d), ypos(v)
+                dot = self.create_oval(px - 4, py - 4, px + 4, py + 4, fill=color,
+                                       outline=SURFACE, width=2)
+                detail = fit_text(self.f_small, f"{cat} · {d.isoformat()}: {v:g} {unit}", self.hint_room)
+                self.tag_bind(dot, "<Enter>", lambda _e, t=detail: self.itemconfigure(self.hint, text=t))
+                self.tag_bind(dot, "<Leave>", lambda _e: self.itemconfigure(
+                    self.hint, text=fit_text(self.f_small, self.base_hint, self.hint_room)))
+
+
+class CategoryLegend(tk.Canvas if HAVE_TK else object):
+    """Wrapping row of colored swatches naming the categories in the line graphs."""
+
+    ROW_H = 20
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=SURFACE, bd=0, highlightthickness=0, height=24)
+        self.categories, self.width_seen = [], 0
+        self.f_small = APP_FONTS["small"]
+        self.bind("<Configure>", self._on_configure)
+
+    def retheme(self):
+        self.configure(bg=SURFACE)
+        self.redraw()
+
+    def set_categories(self, categories):
+        self.categories = list(categories)
+        self.redraw()
+
+    def _on_configure(self, event):
+        if event.width != self.width_seen:  # ignore the height changes redraw() causes
+            self.redraw()
+
+    def redraw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        if w < 60:
+            return
+        self.width_seen = w
+        x, y = 2, 2
+        for cat in self.categories:
+            need = 16 + self.f_small.measure(cat) + 18
+            if x + need > w and x > 2:  # wrap to the next row
+                x, y = 2, y + self.ROW_H
+            color = CATEGORY_COLORS.get(cat, DEFAULT_CATEGORY_COLOR)
+            self.create_rectangle(x, y + 5, x + 10, y + 15, fill=color, outline="")
+            self.create_text(x + 16, y + 10, text=cat, anchor="w", font=self.f_small, fill=TEXT)
+            x += need
+        height = y + self.ROW_H + 2
+        if int(float(self.cget("height"))) != height:
+            self.configure(height=height)
+
+
+class WasteTrackerApp(ttk.Frame if HAVE_TK else object):
+    def __init__(self, root):
+        super().__init__(root, padding=16)
+        self.root = root
+        self.entries = load()
+        self.settings = load_settings()
+        self.sort_key, self.sort_reverse = "id", False
+        self.font_family, _matched = pick_font_family(root, self.settings["dyslexic_font"])
+        apply_theme(root, self.settings["theme"], self.font_family)
+        # Animation bookkeeping (button flashes and the tab-change wipe)
+        self._flash_base, self._flash_style, self._flash_jobs = {}, {}, {}
+        self._wipe, self._wipe_job, self._ready = None, None, False
+        # Keep references to the images, otherwise tkinter garbage-collects them.
+        self.swatches = {cat: make_swatch(root, CATEGORY_COLORS.get(cat, DEFAULT_CATEGORY_COLOR))
+                         for cat in CATEGORIES}
+        self.default_swatch = make_swatch(root, DEFAULT_CATEGORY_COLOR)
+
+        root.title("Laboratory Waste Tracker")
+        root.geometry("1200x720")
+        root.minsize(1100, 600)  # big enough for the filter bar and the charts
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+        self.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        self._build_menu()
+        self._build_form()
+        self._build_tabs()
+        self._build_status_bar()
+        self.refresh()
+        self._bind_button_animation()
+        self._ready = True  # tab animations stay off until the window is built
+
+    # ----------------------------------------------------------- layout
+    def _build_menu(self):
+        """Menu bar with a Settings menu: theme, spreadsheet exports, font, animations."""
+        menubar = tk.Menu(self.root)
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        theme_menu = tk.Menu(settings_menu, tearoff=0)
+        self.v_theme = tk.StringVar(value=self.settings["theme"])
+        for key, label in THEME_LABELS.items():
+            theme_menu.add_radiobutton(label=label, variable=self.v_theme, value=key,
+                                       command=self.on_theme_change)
+        settings_menu.add_cascade(label="Theme", menu=theme_menu)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Export summary to spreadsheet…",
+                                  command=self.export_summary)
+        settings_menu.add_command(label="Export all visualized data to spreadsheet…",
+                                  command=self.export_all)
+        settings_menu.add_separator()
+        self.v_dyslexic = tk.BooleanVar(value=self.settings["dyslexic_font"])
+        settings_menu.add_checkbutton(label="Dyslexia-friendly font", variable=self.v_dyslexic,
+                                      command=self.on_dyslexic_toggle)
+        self.v_no_anim = tk.BooleanVar(value=not self.settings["animations"])
+        settings_menu.add_checkbutton(label="Disable animations", variable=self.v_no_anim,
+                                      command=self.on_animation_toggle)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+        self.root.config(menu=menubar)
+        self._menus = [menubar, settings_menu, theme_menu]
+        self._style_menus()
+
+    def _style_menus(self):
+        if sys.platform == "darwin":  # the macOS menu bar always follows the system
+            return
+        for menu in self._menus:
+            menu.configure(bg=SURFACE, fg=TEXT, activebackground=SELECT,
+                           activeforeground=SELECT_TEXT, selectcolor=ACCENT, bd=0)
+
+    def _build_form(self):
+        form = ttk.Frame(self, style="Card.TFrame", padding=18)
+        form.grid(row=0, column=0, sticky="ns", padx=(0, 16))
+        form.columnconfigure(0, weight=1)
+        ttk.Label(form, text="New entry", style="Heading.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 14))
+
+        self.v_date = tk.StringVar(value=date.today().isoformat())
+        self.v_category = tk.StringVar(value=CATEGORIES[0])
+        self.v_desc = tk.StringVar()
+        self.v_qty = tk.StringVar()
+        self.v_unit = tk.StringVar(value=UNITS[0])
+        self.v_location = tk.StringVar()
+        self.v_notes = tk.StringVar()
+
+        rows = [
+            ("DATE  (YYYY-MM-DD)", ttk.Entry(form, textvariable=self.v_date, width=30)),
+            ("CATEGORY", ttk.Combobox(form, textvariable=self.v_category,
+                                      values=CATEGORIES, state="readonly", width=28)),
+            ("CONTENTS", ttk.Entry(form, textvariable=self.v_desc, width=30)),
+            ("QUANTITY", ttk.Entry(form, textvariable=self.v_qty, width=30)),
+            ("UNIT", ttk.Combobox(form, textvariable=self.v_unit,
+                                  values=UNITS, state="readonly", width=28)),
+            ("LAB / LOCATION", ttk.Entry(form, textvariable=self.v_location, width=30)),
+            ("NOTES", ttk.Entry(form, textvariable=self.v_notes, width=30)),
+        ]
+        for i, (label, widget) in enumerate(rows):
+            ttk.Label(form, text=label, style="Caption.TLabel").grid(
+                row=1 + i * 2, column=0, sticky="w")
+            widget.grid(row=2 + i * 2, column=0, sticky="ew", pady=(3, 11))
+            widget.bind("<Return>", lambda _e: self.add_entry())
+            if i == 1:
+                widget.bind("<<ComboboxSelected>>", lambda _e: self._update_form_swatch())
+            if i == 2:
+                self.desc_entry = widget
+
+        # Colored dot beside the CATEGORY caption, showing the selected category's color
+        self.form_swatch = tk.Label(form, bg=SURFACE, bd=0, highlightthickness=0)
+        self.form_swatch.grid(row=3, column=0, sticky="e")
+        self._update_form_swatch()
+
+        buttons = ttk.Frame(form, style="Card.TFrame")
+        buttons.grid(row=1 + len(rows) * 2, column=0, sticky="ew", pady=(6, 0))
+        buttons.columnconfigure((0, 1), weight=1)
+        ttk.Button(buttons, text="Add entry", style="Accent.TButton",
+                   command=self.add_entry).grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        ttk.Button(buttons, text="Clear", command=self.clear_form).grid(
+            row=0, column=1, sticky="ew", padx=(5, 0))
+
+    def _build_tabs(self):
+        notebook = self.notebook = ttk.Notebook(self)
+        notebook.grid(row=0, column=1, sticky="nsew")
+        notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+        # --- Log tab
+        log = ttk.Frame(notebook, style="Card.TFrame", padding=14)
+        notebook.add(log, text="Waste log")
+        log.columnconfigure(0, weight=1)
+        log.rowconfigure(1, weight=1)
+
+        bar = ttk.Frame(log, style="Card.TFrame")
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        self.f_status = tk.StringVar(value="all")
+        self.f_category = tk.StringVar(value="All")
+        self.f_search = tk.StringVar()
+        self.f_sort = tk.StringVar(value="Entry order")
+        ttk.Label(bar, text="Status", style="Caption.TLabel").pack(side="left")
+        ttk.Combobox(bar, textvariable=self.f_status, values=["all", "stored", "disposed"],
+                     state="readonly", width=8).pack(side="left", padx=(6, 12))
+        ttk.Label(bar, text="Category", style="Caption.TLabel").pack(side="left")
+        ttk.Combobox(bar, textvariable=self.f_category, values=["All"] + CATEGORIES,
+                     state="readonly", width=22).pack(side="left", padx=(6, 12))
+        ttk.Label(bar, text="Search", style="Caption.TLabel").pack(side="left")
+        ttk.Entry(bar, textvariable=self.f_search, width=14).pack(side="left", padx=(6, 12))
+        ttk.Label(bar, text="Sort", style="Caption.TLabel").pack(side="left")
+        sort_box = ttk.Combobox(bar, textvariable=self.f_sort, values=list(SORT_OPTIONS),
+                                state="readonly", width=18)
+        sort_box.pack(side="left", padx=6)
+        sort_box.bind("<<ComboboxSelected>>", self._on_sort_choice)
+        for var in (self.f_status, self.f_category, self.f_search):
+            var.trace_add("write", lambda *_: self.refresh())
+
+        self.tree = ttk.Treeview(log, columns=[c[0] for c in TREE_COLUMNS],
+                                 show="tree headings", selectmode="extended")
+        # The tree column (#0) holds the colored category dot
+        self.tree.heading("#0", text="")
+        self.tree.column("#0", width=40, minwidth=40, stretch=False, anchor="center")
+        for key, heading, width, anchor in TREE_COLUMNS:
+            self.tree.heading(key, text=heading.upper(), anchor=anchor,
+                              command=lambda k=key: self.sort_by(k))
+            self.tree.column(key, width=width, anchor=anchor,
+                             stretch=key in ("description", "notes"))
+        self.tree.tag_configure("odd", background=SURFACE_ALT)
+        self.tree.tag_configure("disposed", foreground=MUTED)
+        yscroll = ttk.Scrollbar(log, orient="vertical", command=self.tree.yview)
+        xscroll = ttk.Scrollbar(log, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        yscroll.grid(row=1, column=1, sticky="ns")
+        xscroll.grid(row=2, column=0, sticky="ew")
+        self.empty_label = ttk.Label(log, style="Empty.TLabel", justify="center")
+
+        actions = ttk.Frame(log, style="Card.TFrame")
+        actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        ttk.Button(actions, text="Mark as disposed",
+                   command=self.mark_disposed).pack(side="left")
+        ttk.Button(actions, text="Delete", style="Danger.TButton",
+                   command=self.delete_selected).pack(side="left", padx=8)
+        ttk.Label(actions, text="Click a heading to sort · Ctrl/Shift-click to select several",
+                  style="Caption.TLabel").pack(side="right")
+        self.tree.bind("<Delete>", lambda _e: self.delete_selected())
+
+        # --- Summary tab
+        summ = ttk.Frame(notebook, style="Card.TFrame", padding=14)
+        notebook.add(summ, text="Summary")
+        summ.columnconfigure(0, weight=1)
+        summ.rowconfigure(1, weight=1)
+
+        cards = ttk.Frame(summ, style="Card.TFrame")
+        cards.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        cards.columnconfigure((0, 1, 2), weight=1, uniform="cards")
+        self.stat_pending, self.stat_disposed, self.stat_total = (
+            tk.StringVar(), tk.StringVar(), tk.StringVar())
+        for col, (caption, var) in enumerate([
+            ("AWAITING DISPOSAL", self.stat_pending),
+            ("DISPOSED", self.stat_disposed),
+            ("TOTAL CONTAINERS", self.stat_total),
+        ]):
+            card = ttk.Frame(cards, style="Stat.TFrame", padding=(16, 12))
+            card.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0 if col == 2 else 6))
+            ttk.Label(card, text=caption, style="StatCaption.TLabel").pack(anchor="w")
+            ttk.Label(card, textvariable=var, style="StatValue.TLabel").pack(anchor="w")
+
+        cols = ("category", "unit", "stored", "disposed")
+        self.summary_tree = ttk.Treeview(summ, columns=cols, show="tree headings")
+        self.summary_tree.heading("#0", text="")
+        self.summary_tree.column("#0", width=40, minwidth=40, stretch=False, anchor="center")
+        for key, heading, width, anchor in [
+            ("category", "Category", 260, "w"), ("unit", "Unit", 70, "center"),
+            ("stored", "Stored", 110, "e"), ("disposed", "Disposed", 110, "e"),
+        ]:
+            self.summary_tree.heading(key, text=heading.upper(), anchor=anchor)
+            self.summary_tree.column(key, width=width, anchor=anchor)
+        self.summary_tree.tag_configure("odd", background=SURFACE_ALT)
+        self.summary_tree.grid(row=1, column=0, sticky="nsew")
+
+        # --- Charts tab: share of records by waste type, one pie per group
+        charts = ttk.Frame(notebook, style="Card.TFrame", padding=14)
+        notebook.add(charts, text="Charts")
+        charts.rowconfigure(1, weight=1)
+        charts.columnconfigure((0, 1, 2), weight=1, uniform="charts")
+        ttk.Label(charts, text="Share of records by waste type (number of containers, not quantity)",
+                  style="Caption.TLabel").grid(row=0, column=0, columnspan=3,
+                                               sticky="w", pady=(0, 10))
+        self.charts = []
+        for col, (title, status, empty_text) in enumerate(CHART_GROUPS):
+            chart = PieChart(charts, title, status, empty_text)
+            chart.grid(row=1, column=col, sticky="nsew",
+                       padx=(0 if col == 0 else 6, 0 if col == 2 else 6))
+            self.charts.append(chart)
+
+        # --- Trends tab: running totals over time. Six line graphs: total, awaiting
+        # disposal and disposed (rows), each for hazardous and non-hazardous waste (columns)
+        trends = ttk.Frame(notebook, style="Card.TFrame", padding=14)
+        notebook.add(trends, text="Trends")
+        trends.columnconfigure((0, 1), weight=1, uniform="trend")
+        for row in (2, 3, 4):
+            trends.rowconfigure(row, weight=1)
+        controls = ttk.Frame(trends, style="Card.TFrame")
+        controls.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(controls, text="Measure", style="Caption.TLabel").pack(side="left")
+        self.f_measure = tk.StringVar(value=list(MEASURES)[0])
+        measure_box = ttk.Combobox(controls, textvariable=self.f_measure,
+                                   values=list(MEASURES), state="readonly", width=14)
+        measure_box.pack(side="left", padx=6)
+        measure_box.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
+        ttk.Label(controls, text="Totals can only be added within one kind of unit. "
+                  "mL counts as L; kg and mg are converted to g.",
+                  style="Caption.TLabel").pack(side="left", padx=12)
+        self.trend_legend = CategoryLegend(trends)
+        self.trend_legend.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.line_charts = []
+        for row, (title, status) in enumerate(LINE_STATUSES):
+            for col, group in enumerate(WASTE_GROUPS):
+                chart = LineChart(trends, f"{group} · {title}", status, group)
+                chart.grid(row=2 + row, column=col, sticky="nsew",
+                           padx=(0 if col == 0 else 6, 0 if col == 1 else 6),
+                           pady=(0 if row == 0 else 8, 0))
+                self.line_charts.append(chart)
+
+    def _build_status_bar(self):
+        self.status = tk.StringVar()
+        ttk.Label(self, textvariable=self.status, style="Muted.TLabel",
+                  anchor="w").grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+
+    # ----------------------------------------------------------- settings
+    def _restyle(self):
+        """Re-apply theme and font everywhere. Returns False if the dyslexia-friendly
+        font was requested but is not installed."""
+        family, matched = pick_font_family(self.root, self.settings["dyslexic_font"])
+        self.font_family = family
+        apply_theme(self.root, self.settings["theme"], family)
+        # Colored category dots (the "other" color changes with the theme)
+        self.swatches = {cat: make_swatch(self.root, CATEGORY_COLORS.get(cat, DEFAULT_CATEGORY_COLOR))
+                         for cat in CATEGORIES}
+        self.default_swatch = make_swatch(self.root, DEFAULT_CATEGORY_COLOR)
+        self.form_swatch.configure(bg=SURFACE)
+        self._update_form_swatch()
+        for tree in (self.tree, self.summary_tree):
+            tree.tag_configure("odd", background=SURFACE_ALT)
+        self.tree.tag_configure("disposed", foreground=MUTED)
+        for chart in self.charts + self.line_charts:
+            chart.retheme()
+        self.trend_legend.retheme()
+        self._style_menus()
+        # Dropdown lists of comboboxes are created on first use, so restyle them directly
+        for widget in walk_widgets(self):
+            if isinstance(widget, ttk.Combobox):
+                try:
+                    popdown = self.root.tk.eval(f"ttk::combobox::PopdownWindow {widget}")
+                    self.root.tk.call(f"{popdown}.f.l", "configure",
+                                      "-background", SURFACE, "-foreground", TEXT,
+                                      "-selectbackground", SELECT, "-selectforeground", SELECT_TEXT)
+                except tk.TclError:
+                    pass
+        self.refresh()
+        return matched
+
+    def on_theme_change(self):
+        self.settings["theme"] = self.v_theme.get()
+        self._restyle()
+        save_settings(self.settings)
+
+    def on_dyslexic_toggle(self):
+        self.settings["dyslexic_font"] = self.v_dyslexic.get()
+        matched = self._restyle()
+        if self.settings["dyslexic_font"]:
+            if not matched:
+                self.settings["dyslexic_font"] = False
+                self.v_dyslexic.set(False)
+                messagebox.showinfo(
+                    "Font not installed",
+                    "No dyslexia-friendly font was found on this computer.\n\n"
+                    "Install OpenDyslexic (opendyslexic.org), Lexend or Atkinson Hyperlegible, "
+                    "then turn this option on again.")
+            elif not self.font_family.startswith("OpenDyslexic"):
+                messagebox.showinfo(
+                    "Using " + self.font_family,
+                    f"OpenDyslexic is not installed, so the program is using {self.font_family} "
+                    "instead. Install OpenDyslexic (opendyslexic.org) to use it automatically.")
+        save_settings(self.settings)
+
+    def on_animation_toggle(self):
+        self.settings["animations"] = not self.v_no_anim.get()
+        save_settings(self.settings)
+
+    # ----------------------------------------------------------- animations
+    def _bind_button_animation(self):
+        for widget in walk_widgets(self):
+            if isinstance(widget, ttk.Button):
+                widget.bind("<ButtonPress-1>", self._on_button_press, add="+")
+
+    def _on_button_press(self, event):
+        """Click feedback: the button flashes a stronger shade and eases back."""
+        if not self.settings["animations"]:
+            return
+        button = event.widget
+        try:
+            if str(button.cget("state")) == "disabled":
+                return
+            key = str(button)
+            base = self._flash_base.setdefault(key, button.cget("style") or "TButton")
+            name = self._flash_style.setdefault(key, f"Flash{len(self._flash_style)}.{base}")
+            style = ttk.Style(self.root)
+            rest = style.lookup(base, "background") or SURFACE
+            flash = mix_colors(rest, TEXT, 0.28)
+            if key in self._flash_jobs:
+                button.after_cancel(self._flash_jobs.pop(key))
+        except tk.TclError:
+            return
+        steps = 9
+
+        def step(i):
+            try:
+                color = mix_colors(flash, rest, ease_out(i / steps))
+                style.configure(name, background=color, lightcolor=color, darkcolor=color)
+                state_colors = [("pressed", color), ("active", color)]
+                style.map(name, background=state_colors, lightcolor=state_colors,
+                          darkcolor=state_colors)
+                if i == 0:
+                    button.configure(style=name)
+                if i < steps:
+                    self._flash_jobs[key] = button.after(24, step, i + 1)
+                else:
+                    button.configure(style=base)
+                    self._flash_jobs.pop(key, None)
+            except tk.TclError:  # window closed mid-animation
+                self._flash_jobs.pop(key, None)
+
+        step(0)
+
+    def _on_tab_changed(self, _event=None):
+        """Tab switch: a curtain in the window color wipes away to reveal the new tab."""
+        if not (self._ready and self.settings["animations"]):
+            return
+        if self._wipe_job:
+            self.after_cancel(self._wipe_job)
+            self._wipe_job = None
+        if self._wipe is not None:
+            self._wipe.destroy()
+            self._wipe = None
+        self.notebook.update_idletasks()
+        page = self.notebook.nametowidget(self.notebook.select())
+        x, y, w, h = page.winfo_x(), page.winfo_y(), page.winfo_width(), page.winfo_height()
+        if w < 50 or h < 50:
+            return
+        cover = self._wipe = tk.Frame(self.notebook, bg=BG, bd=0, highlightthickness=0)
+        steps = 12
+
+        def step(i):
+            if i >= steps:
+                cover.destroy()
+                self._wipe = self._wipe_job = None
+                return
+            width = max(1, round(w * (1 - ease_out(i / steps))))
+            cover.place(x=x + w - width, y=y, width=width, height=h)
+            cover.lift()
+            self._wipe_job = self.after(16, step, i + 1)
+
+        step(0)
+
+    # ----------------------------------------------------------- exports
+    def export_summary(self):
+        self._export("Export summary", f"waste_summary_{date.today().isoformat()}.xlsx",
+                     summary_sheets(self.entries))
+
+    def export_all(self):
+        sheets = (summary_sheets(self.entries)
+                  + [charts_sheet(self.entries), trends_sheet(self.entries)])
+        self._export("Export all visualized data",
+                     f"waste_data_{date.today().isoformat()}.xlsx", sheets)
+
+    def _export(self, title, default_name, sheets):
+        if not self.entries:
+            messagebox.showinfo("Nothing to export", "No waste has been logged yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title=title, initialfile=default_name,
+            defaultextension=".xlsx", filetypes=[("Excel workbook", "*.xlsx")])
+        if not path:
+            return
+        try:
+            write_xlsx(path, sheets)
+        except OSError as exc:
+            messagebox.showerror("Could not export", f"Failed to write {path}:\n{exc}")
+            return
+        messagebox.showinfo("Export complete", f"Saved to:\n{path}")
+
+    # ----------------------------------------------------------- actions
+    def add_entry(self):
+        entry, error = build_entry(
+            self.entries, self.v_date.get(), self.v_category.get(), self.v_desc.get(),
+            self.v_qty.get(), self.v_unit.get(), self.v_location.get(), self.v_notes.get(),
+        )
+        if error:
+            messagebox.showwarning("Check the form", error)
+            return
+        self.entries.append(entry)
+        self._save_and_refresh()
+        self.clear_form(keep_context=True)
+        self.status.set(f"Saved entry #{entry['id']}  ·  " + self.status.get())
+
+    def clear_form(self, keep_context=False):
+        self.v_desc.set("")
+        self.v_qty.set("")
+        self.v_notes.set("")
+        if not keep_context:
+            self.v_date.set(date.today().isoformat())
+            self.v_category.set(CATEGORIES[0])
+            self.v_unit.set(UNITS[0])
+            self.v_location.set("")
+            self._update_form_swatch()
+        self.desc_entry.focus_set()
+
+    def _swatch(self, category):
+        return self.swatches.get(category, self.default_swatch)
+
+    def _update_form_swatch(self):
+        self.form_swatch.configure(image=self._swatch(self.v_category.get()))
+
+    def _selected_entries(self):
+        ids = {int(self.tree.set(item, "id")) for item in self.tree.selection()}
+        return [e for e in self.entries if e["id"] in ids]
+
+    def mark_disposed(self):
+        chosen = [e for e in self._selected_entries() if e["status"] == "stored"]
+        if not chosen:
+            messagebox.showinfo("Nothing to do", "Select one or more stored entries first.")
+            return
+        when = simpledialog.askstring(
+            "Disposal date", f"Disposal date for {len(chosen)} entr{'y' if len(chosen) == 1 else 'ies'} (YYYY-MM-DD):",
+            initialvalue=date.today().isoformat(), parent=self.root)
+        if when is None:
+            return
+        when = clean(when)
+        if not valid_date(when):
+            messagebox.showwarning("Invalid date", "Date must be in YYYY-MM-DD format.")
+            return
+        for e in chosen:
+            e["status"], e["disposed_date"] = "disposed", when
+        self._save_and_refresh()
+
+    def delete_selected(self):
+        chosen = self._selected_entries()
+        if not chosen:
+            messagebox.showinfo("Nothing selected", "Select one or more entries to delete.")
+            return
+        if not messagebox.askyesno(
+                "Delete entries",
+                f"Permanently delete {len(chosen)} entr{'y' if len(chosen) == 1 else 'ies'}?",
+                icon="warning"):
+            return
+        gone = {e["id"] for e in chosen}
+        self.entries = [e for e in self.entries if e["id"] not in gone]
+        self._save_and_refresh()
+
+    def sort_by(self, key):
+        """Column-heading click: sort by that column, click again to reverse."""
+        if self.sort_key == key:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_key, self.sort_reverse = key, False
+        # Keep the Sort dropdown in step with what the table is actually doing
+        self.f_sort.set(next((name for name, spec in SORT_OPTIONS.items()
+                              if spec == (self.sort_key, self.sort_reverse)),
+                             "Sorted by column"))
+        self.refresh()
+
+    def _on_sort_choice(self, _event=None):
+        self.sort_key, self.sort_reverse = SORT_OPTIONS[self.f_sort.get()]
+        self.refresh()
+
+    def _save_and_refresh(self):
+        try:
+            save(self.entries)
+        except OSError as exc:
+            messagebox.showerror("Could not save", f"Failed to write {DATA_FILE}:\n{exc}")
+        self.refresh()
+
+    # ----------------------------------------------------------- display
+    def refresh(self):
+        rows = filter_entries(self.entries, self.f_status.get(),
+                              self.f_category.get(), self.f_search.get())
+        rows = sort_entries(rows, self.sort_key, self.sort_reverse)
+
+        self.tree.delete(*self.tree.get_children())
+        for i, e in enumerate(rows):
+            values = []
+            for key, *_ in TREE_COLUMNS:
+                if key == "quantity":
+                    values.append(f"{e[key]:g}")
+                elif key == "status":
+                    values.append(STATUS_LABEL.get(e[key], e[key]))
+                else:
+                    values.append(e[key])
+            tags = (["odd"] if i % 2 else []) + (["disposed"] if e["status"] == "disposed" else [])
+            self.tree.insert("", "end", values=values, tags=tags,
+                             image=self._swatch(e["category"]))
+
+        # Friendly empty state
+        if rows:
+            self.empty_label.place_forget()
+        else:
+            self.empty_label.config(
+                text="No entries match your filters." if self.entries
+                else "No waste logged yet.\nAdd your first container using the form on the left.")
+            self.empty_label.place(in_=self.tree, relx=0.5, rely=0.42, anchor="center")
+
+        self.summary_tree.delete(*self.summary_tree.get_children())
+        for i, (cat, unit, stored, disposed) in enumerate(summarize(self.entries)):
+            self.summary_tree.insert("", "end", values=(cat, unit, f"{stored:g}", f"{disposed:g}"),
+                                     tags=("odd",) if i % 2 else (),
+                                     image=self._swatch(cat))
+
+        for chart in self.charts:
+            chart.set_entries(self.entries)
+
+        shown = set()
+        for chart in self.line_charts:
+            chart.set_data(self.entries, self.f_measure.get())
+            shown.update(cat for cat, _points in chart.series)
+        self.trend_legend.set_categories(
+            [c for c in CATEGORIES if c in shown] + sorted(shown - set(CATEGORIES)))
+
+        pending = sum(1 for e in self.entries if e["status"] == "stored")
+        self.stat_pending.set(str(pending))
+        self.stat_disposed.set(str(len(self.entries) - pending))
+        self.stat_total.set(str(len(self.entries)))
+        self.status.set(f"Showing {len(rows)} of {len(self.entries)} entries  ·  {pending} awaiting disposal")
+
+
+def run_gui():
+    """Open the window. Returns False if it could not be opened."""
+    enable_hidpi()
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:  # e.g. no display available
+        print(f"Could not open a window ({exc}).")
+        return False
+    WasteTrackerApp(root)
+    root.mainloop()
+    return True
+
+
+# ================================================================== entry point
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Laboratory Waste Tracker")
+    parser.add_argument("--cli", action="store_true",
+                        help="use the text menu in the terminal instead of the window")
+    args = parser.parse_args(argv)
+
+    if not args.cli:
+        if not HAVE_TK:
+            print("tkinter is not installed, so the window can't open. Using the text menu.")
+        elif run_gui():
+            return
+        print("Falling back to the text menu (use --cli to skip the window next time).")
+    run_cli()
+
+
+if __name__ == "__main__":
+    main()
